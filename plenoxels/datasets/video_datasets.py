@@ -402,7 +402,7 @@ def load_llffvideo_poses(datadir: str,
     if split == 'train':
         split_ids = np.arange(1, poses.shape[0])
     elif split == 'test':
-        split_ids = np.array([0])
+        split_ids = np.array([0]) # Benhao: use first one for test
     else:
         split_ids = np.arange(poses.shape[0])
     if 'coffee_martini' in datadir:
@@ -449,11 +449,23 @@ def load_llffvideo_data(videopaths: List[str],
 
 @torch.no_grad()
 def dynerf_isg_weight(imgs, median_imgs, gamma):
-    # imgs is [num_cameras * num_frames, h, w, 3]
-    # median_imgs is [num_cameras, h, w, 3]
+    """
+    Computes ISG (Importance-driven Scene-adaptive Geometry-sampling) weights.
+    This weight measures how much each pixel deviates from the static background (median image).
+    Formula (from DyNeRF paper):
+        ψ(p,t) = E(p,t)² / (E(p,t)² + γ²)
+        where E(p,t) = I(p,t) - I_M(p) is the difference between the current frame and the median image.
+    """
+    # imgs: [num_cameras * num_frames, H, W, 3]
+    # median_imgs: [num_cameras, H, W, 3]
     assert imgs.dtype == torch.uint8
     assert median_imgs.dtype == torch.uint8
     num_cameras, h, w, c = median_imgs.shape
+
+    # 1. Compute the difference E(p,t) = I(p,t) - I_M(p)
+    #    - Reshape imgs to [num_cameras, num_frames, H, W, C]
+    #    - Normalize pixel values from [0, 255] to [0, 1]
+    #    - median_imgs [num_cameras, 1, H, W, C] is broadcast over all frames for subtraction.
     squarediff = (
         imgs.view(num_cameras, -1, h, w, c)
             .float()  # creates new tensor, so later operations can be in-place
@@ -461,30 +473,52 @@ def dynerf_isg_weight(imgs, median_imgs, gamma):
             .sub_(
                 median_imgs[:, None, ...].float().div_(255.0)
             )
-            .square_()  # noqa
-    )  # [num_cameras, num_frames, h, w, 3]
-    # differences = median_imgs[:, None, ...] - imgs.view(num_cameras, -1, h, w, c)  # [num_cameras, num_frames, h, w, 3]
-    # squarediff = torch.square_(differences)
+            .square_()  # Compute the squared difference E(p,t)²
+    )  # [num_cameras, num_frames, H, W, 3]
+
+    # 2. Apply the formula ψ = E² / (E² + γ²)
+    #    This makes weights for static regions approach 0 and for dynamic regions approach 1.
     psidiff = squarediff.div_(squarediff + gamma**2)
+
+    # 3. Average over the three RGB channels to get a single-channel weight map.
     psidiff = (1./3) * torch.sum(psidiff, dim=-1)  # [num_cameras, num_frames, h, w]
-    return psidiff  # valid probabilities, each in [0, 1]
+    return psidiff  # Returns weights in the range [0, 1]
 
 
 @torch.no_grad()
 def dynerf_ist_weight(imgs, num_cameras, alpha=0.1, frame_shift=25):  # DyNerf uses alpha=0.1
+    """
+    Computes IST (Importance-driven Scene-adaptive Temporal-sampling) weights.
+    This weight measures the intensity of temporal changes for each pixel by comparing it with adjacent frames.
+    Formula (from DyNeRF paper):
+        τ(p,t) = max( max_{s∈[1,S]} |I(p,t) - I(p, t±s)|, α )
+    """
     assert imgs.dtype == torch.uint8
     N, h, w, c = imgs.shape
+    # Reshape input to [num_cameras, num_timesteps, H, W, 3]
     frames = imgs.view(num_cameras, -1, h, w, c).float()  # [num_cameras, num_timesteps, h, w, 3]
     max_diff = None
+    # Define the temporal window, s from 1 to frame_shift
     shifts = list(range(frame_shift + 1))[1:]
+    # Iterate over all temporal shifts s
     for shift in shifts:
+        # 1. Create videos shifted forwards and backwards in time by s frames.
         shift_left = torch.cat([frames[:, shift:, ...], torch.zeros(num_cameras, shift, h, w, c)], dim=1)
         shift_right = torch.cat([torch.zeros(num_cameras, shift, h, w, c), frames[:, :-shift, ...]], dim=1)
+
+        # 2. Compute the absolute color difference |I(p,t) - I(p,t±s)| between the current frame
+        #    and the shifted frames, and take the maximum of the two.
         mymax = torch.maximum(torch.abs_(shift_left - frames), torch.abs_(shift_right - frames))
+
+        # 3. Accumulate the maximum difference found across the entire temporal window S.
         if max_diff is None:
             max_diff = mymax
         else:
             max_diff = torch.maximum(max_diff, mymax)  # [num_timesteps, h, w, 3]
+
+    # 4. Average over the RGB color channels.
     max_diff = torch.mean(max_diff, dim=-1)  # [num_timesteps, h, w]
+
+    # 5. Apply alpha as a lower bound for the weights, ensuring all pixels have a chance to be sampled.
     max_diff = max_diff.clamp_(min=alpha)
     return max_diff

@@ -72,30 +72,68 @@ def get_rays(directions: torch.Tensor,
              ndc_near: float = 1.0,
              intrinsics: Optional[Intrinsics] = None,
              normalize_rd: bool = True):
-    """Get ray origin and normalized directions in world coordinate for all pixels in one image.
-    Reference: https://www.scratchapixel.com/lessons/3d-basic-rendering/
-               ray-tracing-generating-camera-rays/standard-coordinate-systems
+    """
+    Computes ray origins and directions in world coordinates.
 
     Args:
-        directions:
-        c2w:
-        ndc:
-        ndc_near:
-        intrinsics:
-        normalize_rd:
+        directions (torch.Tensor): Ray directions in camera coordinate system.
+                                   Shape: [num_rays, 3] or [H, W, 3].
+                                   In camera space, +X is right, +Y is up, and -Z is looking forward.
+        c2w (torch.Tensor): Camera-to-world transformation matrix.
+                            Shape: [3, 4] for a single camera, or [num_rays, 3, 4] for multiple.
+        ndc (bool): If True, transform rays to Normalized Device Coordinates.
+        ndc_near (float): The near plane distance for NDC transformation.
+        intrinsics (Optional[Intrinsics]): Camera intrinsics, required if ndc is True.
+        normalize_rd (bool): If True, normalize ray direction vectors to unit length.
 
     Returns:
-
+        ro (torch.Tensor): Ray origins in world coordinates. Shape: [num_rays, 3].
+        rd (torch.Tensor): Ray directions in world coordinates. Shape: [num_rays, 3].
     """
+    # Step 1: Reshape camera-space directions to a flat list.
+    # - Shape change: [H, W, 3] -> [num_rays, 3], where num_rays = H * W.
+    # - Physical meaning: We are treating the grid of pixels as a batch of rays.
     directions = directions.view(-1, 3)  # [n_rays, 3]
+
+    # Step 2: Ensure c2w matrix has a batch dimension for consistent processing.
+    # - Shape change: [3, 4] -> [1, 3, 4] if it's a single camera.
+    # - Physical meaning: Standardizing the matrix format to handle both a single pose
+    #   for all rays or a unique pose per ray.
     if len(c2w.shape) == 2:
         c2w = c2w[None, ...]
+
+    # Step 3: Rotate ray directions from camera space to world space.
+    # - `c2w[:, :3, :3]` extracts the 3x3 rotation matrix from the c2w transform. Shape: [B, 3, 3]
+    # - The operation is equivalent to a matrix-vector product (d_world = R * d_camera) for each ray.
+    # - Shape change: `directions` [num_rays, 3] -> `rd` [num_rays, 3]
+    # - Physical meaning: This aligns the ray direction vectors with the global world coordinate system.
+    #   For example, a ray pointing 'forward' (-Z) from the camera is now pointing in the
+    #   direction the camera was facing in the world.
     rd = (directions[:, None, :] * c2w[:, :3, :3]).sum(dim=-1)
+
+    # Step 4: Get ray origins from the c2w matrix.
+    # - `c2w[:, :3, 3]` extracts the translation vector (camera's position in the world). Shape: [B, 3]
+    # - `torch.broadcast_to` duplicates this world position for every ray.
+    # - Shape change: `c2w`'s translation [B, 3] -> `ro` [num_rays, 3].
+    # - Physical meaning: Sets the starting point of all rays to be the camera's center of projection
+    #   in world coordinates. All rays from one image originate from the same point.
     ro = torch.broadcast_to(c2w[:, :3, 3], directions.shape)
+
+    # Step 5 (Optional): Transform rays to Normalized Device Coordinates (NDC) space.
+    # - Physical meaning: This is a non-linear transformation that remaps the entire 3D space
+    #   in front of the camera into a cube. It's essential for unbounded, forward-facing
+    #   scenes (like in the original NeRF paper) as it brings "points at infinity" to a finite depth.
+    # - The ray origins and directions are fundamentally changed by this projection.
     if ndc:
         assert intrinsics is not None, "intrinsics must not be None when NDC active."
         ro, rd = ndc_rays_blender(
             intrinsics=intrinsics, near=ndc_near, rays_o=ro, rays_d=rd)
+
+    # Step 6 (Optional): Normalize ray directions to be unit vectors.
+    # - Shape change: None. Only the magnitude of the vectors in `rd` is changed.
+    # - Physical meaning: Ensures all direction vectors have a length of 1. This simplifies
+    #   downstream calculations, as the distance along a ray can be represented by a single
+    #   scalar 't' in the formula: P(t) = ro + t * rd.
     if normalize_rd:
         rd /= torch.linalg.norm(rd, dim=-1, keepdim=True)
     return ro, rd

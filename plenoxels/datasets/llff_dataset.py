@@ -110,7 +110,8 @@ class LLFFDataset(BaseDataset):
                                   intrinsics=self.intrinsics, normalize_rd=True)  # h*w, 3
         out["rays_o"] = rays_o
         out["rays_d"] = rays_d
-        out["bg_color"] = torch.tensor([[1.0, 1.0, 1.0]])
+        # Set background color to white (1,1,1) since LLFF dataset images are captured with white background
+        out["bg_color"] = torch.tensor([[1.0, 1.0, 1.0]])  # RGB white background
         return out
 
 

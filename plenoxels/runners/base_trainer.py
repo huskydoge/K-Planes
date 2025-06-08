@@ -53,7 +53,7 @@ class BaseTrainer(abc.ABC):
         self.global_step: Optional[int] = None
         self.loss_info: Optional[Dict[str, EMA]] = None
 
-        self.model = self.init_model(**self.extra_args)
+        self.model = self.init_model(**self.extra_args) # NOTE: Lowrank Model
         self.optimizer = self.init_optim(**self.extra_args)
         self.scheduler = self.init_lr_scheduler(**self.extra_args)
         self.criterion = torch.nn.MSELoss(reduction='mean')
@@ -68,6 +68,15 @@ class BaseTrainer(abc.ABC):
         return None  # noqa
 
     def train_step(self, data, **kwargs) -> bool:
+        """
+        data:
+            rays_o: (N, 3)
+            rays_d: (N, 3)
+            imgs: (N, 3)
+            near_fars: (N, 2)
+            timestamps: (N, )
+            bg_color: (3, )
+        """
         self.model.train()
         data = self._move_data_to_device(data)
         if "timestamps" not in data:
