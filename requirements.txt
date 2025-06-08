@@ -7,4 +7,5 @@ lpips
 imageio
 torchmetrics
 scikit-image
-tinycudann
+matplotlib
+tensorboard
