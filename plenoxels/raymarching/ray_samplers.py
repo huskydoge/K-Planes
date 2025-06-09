@@ -95,18 +95,27 @@ class RaySamples:
 
 @dataclass
 class RayBundle:
-    """A bundle of ray parameters."""
+    """
+    A bundle of ray parameters representing one or more rays cast from camera(s).
+    
+    This class encapsulates the fundamental properties of rays before they are discretized
+    into sampling intervals. Think of it as defining continuous rays in 3D space.
+    """
 
-    """Ray origins (XYZ)"""
-    origins: torch.Tensor  # [..., 3]
-    """Unit ray direction vector"""
-    directions: torch.Tensor  # [..., 3]
-    """Distance along ray to start sampling"""
-    nears: Optional[torch.Tensor] = None  # [..., 1]
-    """Rays Distance along ray to stop sampling"""
-    fars: Optional[torch.Tensor] = None  # [..., 1]
+    """Ray origins (XYZ) - The starting points of rays in world coordinates."""
+    origins: torch.Tensor  # [..., 3] - Shape: [num_rays, 3] or [batch_size, num_rays, 3]
+    
+    """Unit ray direction vectors - The normalized directions rays travel."""
+    directions: torch.Tensor  # [..., 3] - Shape: [num_rays, 3] or [batch_size, num_rays, 3]
+    
+    """Distance along ray to start sampling - Near clipping plane."""
+    nears: Optional[torch.Tensor] = None  # [..., 1] - Shape: [num_rays, 1]
+    
+    """Distance along ray to stop sampling - Far clipping plane."""
+    fars: Optional[torch.Tensor] = None  # [..., 1] - Shape: [num_rays, 1]
 
     def __len__(self):
+        """Returns the total number of rays in this bundle."""
         num_rays = torch.numel(self.origins) // self.origins.shape[-1]
         return num_rays
 
@@ -118,21 +127,57 @@ class RayBundle:
         spacing_ends: Optional[torch.Tensor] = None,
         spacing_to_euclidean_fn: Optional[Callable] = None,
     ) -> RaySamples:
-        """Produces samples for each ray by projection points along the ray direction. Currently samples uniformly.
-        Args:
-            bin_starts: Distance from origin to start of bin.
-                TensorType["bs":..., "num_samples", 1]
-            bin_ends: Distance from origin to end of bin.
-        Returns:
-            Samples projected along ray.
         """
-        deltas = bin_ends - bin_starts
+        Converts continuous rays into discrete sampling intervals (bins) for volume rendering.
+        
+        This is the key step that transforms a mathematical ray into a set of 3D intervals
+        that can be queried by the neural field (K-Planes model).
+        
+        Args:
+            bin_starts: Distance from ray origin to the start of each sampling interval.
+                       Shape: [..., num_samples, 1]
+                       Physical meaning: t_i values where each interval begins.
+            bin_ends: Distance from ray origin to the end of each sampling interval.
+                     Shape: [..., num_samples, 1] 
+                     Physical meaning: t_{i+1} values where each interval ends.
+            spacing_starts: Optional spacing coordinates for non-uniform sampling.
+            spacing_ends: Optional spacing coordinates for non-uniform sampling.
+            spacing_to_euclidean_fn: Optional function to convert spacing to Euclidean distance.
+        
+        Returns:
+            RaySamples: A data structure containing all the discretized sampling information
+                       needed for volume rendering and neural field queries.
+        """
+        # Calculate the length of each sampling interval (Δt_i = t_{i+1} - t_i)
+        # This is crucial for volume rendering integration: larger intervals contribute more
+        # to the final pixel color.
+        deltas = bin_ends - bin_starts  # [..., num_samples, 1]
+        
         return RaySamples(
+            # Broadcast ray origins to match the number of samples per ray
+            # Shape change: [..., 3] -> [..., 1, 3] -> [..., num_samples, 3] (via broadcasting)
+            # Physical meaning: Every sample interval knows which ray it belongs to
             origins=self.origins[..., None, :],  # [..., 1, 3]
+            
+            # Broadcast ray directions to match the number of samples per ray  
+            # Shape change: [..., 3] -> [..., 1, 3] -> [..., num_samples, 3] (via broadcasting)
+            # Physical meaning: Every sample interval knows the ray direction
             directions=self.directions[..., None, :],  # [..., 1, 3]
-            starts=bin_starts,  # [..., num_samples, 1]  world
-            ends=bin_ends,  # [..., num_samples, 1]      world
-            deltas=deltas,  # [..., num_samples, 1]  world coo
+            
+            # Start distances for each sampling interval along the ray
+            # Physical meaning: For each ray, this defines where each sampling bin begins
+            starts=bin_starts,  # [..., num_samples, 1]  
+            
+            # End distances for each sampling interval along the ray
+            # Physical meaning: For each ray, this defines where each sampling bin ends
+            ends=bin_ends,  # [..., num_samples, 1]      
+            
+            # Length of each sampling interval (integration step size)
+            # Physical meaning: The "thickness" of each bin in world coordinates
+            # Larger deltas mean the interval has more influence on the final color
+            deltas=deltas,  # [..., num_samples, 1]  
+            
+            # Optional: Alternative spacing coordinates (e.g., for warped sampling)
             spacing_starts=spacing_starts,  # [..., num_samples, 1]
             spacing_ends=spacing_ends,  # [..., num_samples, 1]
             spacing_to_euclidean_fn=spacing_to_euclidean_fn,
