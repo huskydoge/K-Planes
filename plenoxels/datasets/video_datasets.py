@@ -59,6 +59,8 @@ class Video360Dataset(BaseDataset):
             raise ValueError("Options 'contraction' and 'ndc' are exclusive.")
         if "lego" in datadir or "dnerf" in datadir:
             dset_type = "synthetic"
+        elif "dmlab" in datadir:
+            dset_type = "dmlab"
         else:
             dset_type = "llff"
 
@@ -132,6 +134,25 @@ class Video360Dataset(BaseDataset):
                 timestamps = (timestamps.float() / torch.amax(timestamps)) * 2 - 1
             intrinsics = load_360_intrinsics(
                 transform, img_h=img_h, img_w=img_w, downsample=self.downsample)
+        elif dset_type == "dmlab":
+            if split == "render":
+                # Load data and create render poses
+                poses, imgs, timestamps, per_cam_near_fars = load_dmlab_data(datadir, split='train', max_tsteps=self.max_tsteps)
+                # Generate spiral render path around the scene
+                render_poses = generate_dmlab_render_poses(poses.numpy(), n_frames=120)
+                self.poses = torch.from_numpy(render_poses).float()
+                self.per_cam_near_fars = per_cam_near_fars[:1]  # Use first camera's near/far
+                timestamps = torch.linspace(0, 119, len(self.poses))
+                imgs = None
+            else:
+                poses, imgs, timestamps, per_cam_near_fars = load_dmlab_data(datadir, split=split, max_tsteps=self.max_tsteps)
+                self.poses = poses.float()
+                self.per_cam_near_fars = per_cam_near_fars.float()
+            intrinsics = load_dmlab_intrinsics(img_h=128, img_w=128, fov_degrees=90.0, downsample=self.downsample)
+            self.global_translation = torch.tensor([0, 0, 0])
+            self.global_scale = torch.tensor([1, 1, 1])
+            # Normalize timestamps between -1, 1
+            timestamps = (timestamps.float() / (timestamps.max() + 1e-6)) * 2 - 1
         else:
             raise ValueError(datadir)
 
@@ -147,7 +168,8 @@ class Video360Dataset(BaseDataset):
         if split == 'train':
             imgs = imgs.view(-1, imgs.shape[-1])
         elif imgs is not None:
-            imgs = imgs.view(-1, intrinsics.height * intrinsics.width, imgs.shape[-1])
+            # Correct reshaping: preserve frame structure [n_frames, height*width, 3]
+            imgs = imgs.view(imgs.shape[0], -1, imgs.shape[-1])
 
         # ISG/IST weights are computed on 4x subsampled data.
         weights_subsampled = int(4 / downsample)
@@ -273,10 +295,19 @@ class Video360Dataset(BaseDataset):
             camera_id = torch.div(image_id, num_frames_per_camera, rounding_mode='floor')  # (num_rays)
             out['near_fars'] = self.per_cam_near_fars[camera_id, :]
         else:
-            out['near_fars'] = self.per_cam_near_fars  # Only one test camera
+            # For test/validation, use the near_far bounds corresponding to current image
+            frame_id = index // (h * w) if self.split == 'test' else 0
+            frame_id = min(frame_id, len(self.per_cam_near_fars) - 1)  # Clamp to available frames
+            out['near_fars'] = self.per_cam_near_fars[frame_id:frame_id+1]  # Keep 2D shape [1, 2]
 
         if self.imgs is not None:
-            out['imgs'] = (self.imgs[index] / 255.0).view(-1, self.imgs.shape[-1])
+            if self.split == 'train':
+                out['imgs'] = (self.imgs[index] / 255.0).view(-1, self.imgs.shape[-1])
+            else:
+                # For test split, imgs is organized as [n_frames, height*width, 3]
+                # index is the frame number, we need all pixels of that frame
+                frame_id = index
+                out['imgs'] = (self.imgs[frame_id] / 255.0)  # Already [height*width, 3]
 
         c2w = self.poses[image_id]                                    # [num_rays or 1, 3, 4]
         camera_dirs = stack_camera_dirs(x, y, self.intrinsics, True)  # [num_rays, 3]
@@ -315,6 +346,10 @@ def get_bbox(datadir: str, dset_type: str, is_contracted=False) -> torch.Tensor:
         radius = 1.5
     elif dset_type == 'llff':
         return torch.tensor([[-3.0, -1.67, -1.2], [3.0, 1.67, 1.2]])
+    elif dset_type == 'dmlab':
+        # DMlab specific bounding box based on typical room dimensions
+        # From analysis: X:[143-663], Y:[137-550], Z:[51] with margin
+        return torch.tensor([[92.9, 86.5, 1.1], [712.6, 600.0, 101.1]])
     else:
         radius = 1.3
     return torch.tensor([[-radius, -radius, -radius], [radius, radius, radius]])
@@ -522,3 +557,355 @@ def dynerf_ist_weight(imgs, num_cameras, alpha=0.1, frame_shift=25):  # DyNerf u
     # 5. Apply alpha as a lower bound for the weights, ensuring all pixels have a chance to be sampled.
     max_diff = max_diff.clamp_(min=alpha)
     return max_diff
+
+
+# ========================================
+# DMlab Dataset Functions
+# ========================================
+
+def load_dmlab_data(datadir: str, split: str, max_tsteps: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load DMlab data from npz file.
+    
+    Args:
+        datadir (str): Directory containing the npz file
+        split (str): 'train' or 'test'
+        max_tsteps (Optional[int]): Maximum number of timesteps to load
+    
+    Returns:
+        Tuple of:
+        - poses: [N, 3, 4] camera-to-world transformation matrices
+        - imgs: [N, H, W, 3] RGB images in range [0, 1]
+        - timestamps: [N] frame indices
+        - near_fars: [N, 2] near and far bounds for each frame
+    """
+    # Find npz file in the directory
+    npz_files = glob.glob(os.path.join(datadir, "*.npz"))
+    if not npz_files:
+        raise FileNotFoundError(f"No .npz files found in {datadir}")
+    
+    data_path = npz_files[0]  # Use first npz file
+    log.info(f"Loading DMlab data from: {data_path}")
+    
+    data = np.load(data_path)
+    
+    # Load video data: (T, H, W, C) uint8 [0, 255]
+    video = data['video']  # (T, H, W, 3)
+    num_frames = video.shape[0]
+    
+    # Load camera poses and rotations
+    camera_pos = data['camera_pos'].reshape(-1, 3)  # (T, 3)
+    
+    # Use quaternion rotation if available, otherwise fall back to euler angles
+    if 'rot' in data and data['rot'].shape[1] == 4:
+        camera_rot = data['rot']  # (T, 4) quaternions [w, x, y, z]
+    else:
+        camera_rot = data['camera_rot'].reshape(-1, 3)  # (T, 3) in degrees
+    
+    # Load projection matrices for near/far extraction
+    proj_matrices = data['proj_matrices']  # (T, 4, 4)
+    
+    # Load depth if available (Note: DMlab depth is reverse NDC depth)
+    # depth_video = data['depth_video']  # (T, H, W, 1) - zfar=0, znear=1
+    
+    if max_tsteps is not None and max_tsteps < num_frames:
+        # Subsample frames
+        step = num_frames // max_tsteps
+        indices = np.arange(0, num_frames, step)[:max_tsteps]
+        log.info(f"Subsampling DMlab data: {num_frames} -> {len(indices)} frames")
+        
+        video = video[indices]
+        camera_pos = camera_pos[indices]
+        camera_rot = camera_rot[indices]
+        proj_matrices = proj_matrices[indices]
+        num_frames = len(indices)
+    
+    # Create train/test split
+    if split == 'train':
+        # Use first 70% for training (ensure sufficient frames)
+        split_point = max(1, int(0.7 * num_frames))
+        frame_indices = np.arange(0, split_point)
+    elif split == 'test':
+        # Use last 30% for testing (ensure sufficient frames for video)
+        split_point = max(1, int(0.7 * num_frames))
+        frame_indices = np.arange(split_point, num_frames)
+    else:
+        # Use all frames
+        frame_indices = np.arange(num_frames)
+    
+    # Apply split
+    video = video[frame_indices]
+    camera_pos = camera_pos[frame_indices]
+    camera_rot = camera_rot[frame_indices]
+    proj_matrices = proj_matrices[frame_indices]
+    
+    # Convert images to [0, 1] range
+    imgs = torch.from_numpy(video.astype(np.float32) / 255.0)  # [N, H, W, 3]
+    
+    # Convert camera poses
+    poses = dmlab_poses_to_c2w(camera_pos, camera_rot)  # [N, 3, 4]
+    
+    # Extract near/far bounds from projection matrices
+    near_fars = extract_near_far_from_projection(proj_matrices)  # [N, 2]
+    
+    # Create timestamps
+    timestamps = torch.arange(len(frame_indices), dtype=torch.float32)
+    
+    log.info(f"Loaded DMlab {split} data: {len(imgs)} frames, "
+             f"image size: {imgs.shape[1]}x{imgs.shape[2]}, "
+             f"pose range: {poses.min():.3f} to {poses.max():.3f}")
+    
+    return poses, imgs, timestamps, near_fars
+
+
+def quaternion_to_rotation_matrix(q):
+    """Convert quaternion [w, x, y, z] to rotation matrix."""
+    w, x, y, z = q
+    return np.array([
+        [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
+        [2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
+        [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
+    ], dtype=np.float32)
+
+
+def calculate_c2w(pos, rot):
+    """
+    Camera2world matrix
+
+    pos: (T, 3), the camera position under world coordinate
+    rot: (T, 4), the camera rotation under world coordinate (quaternion [w,x,y,z])
+    """
+    camera_matrices = []
+    
+    for i in range(len(pos)):
+        # Convert quaternion to rotation matrix
+        R = quaternion_to_rotation_matrix(rot[i])
+        U, _, Vt = np.linalg.svd(R)
+        R = U @ Vt
+        # Build c2w matrix. Use transpose for world-to-camera to camera-to-world conversion.
+        c2w = np.eye(4)
+        c2w[:3, :3] = R.T
+        if pos[i].ndim == 1:
+            c2w[:3, 3] = np.array([pos[i][0], pos[i][1], pos[i][2]])
+        else:
+            c2w[:3, 3] = np.array([pos[i][0][0], pos[i][0][1], pos[i][0][2]])
+        
+        camera_matrices.append(c2w)
+    
+    camera_matrices = np.array(camera_matrices, dtype=np.float32)  # (T, 4, 4)
+    return torch.tensor(camera_matrices, dtype=torch.float32)  # (T, 4, 4)
+
+
+def dmlab_poses_to_c2w(camera_pos: np.ndarray, camera_rot: np.ndarray) -> torch.Tensor:
+    """Convert DMlab camera position and rotation to camera-to-world matrices.
+    
+    Args:
+        camera_pos: [N, 3] camera positions in world coordinates
+        camera_rot: [N, 3] camera rotations in degrees (pitch, yaw, roll) OR [N, 4] quaternions
+    
+    Returns:
+        [N, 3, 4] camera-to-world transformation matrices
+    """
+    if camera_rot.shape[1] == 4:
+        # Quaternion format
+        c2w_matrices = calculate_c2w(camera_pos, camera_rot)
+        return c2w_matrices[:, :3, :]  # Return [N, 3, 4]
+    else:
+        # Euler angles format - fallback to original implementation
+        import math
+        
+        N = camera_pos.shape[0]
+        c2w_matrices = np.zeros((N, 3, 4), dtype=np.float32)
+        
+        for i in range(N):
+            pos = camera_pos[i]
+            rot = camera_rot[i]
+            
+            # Convert degrees to radians
+            pitch = math.radians(rot[0])  # rotation around X axis
+            yaw = math.radians(rot[1])    # rotation around Y axis  
+            roll = math.radians(rot[2])   # rotation around Z axis
+            
+            # Create rotation matrices
+            # Rotation order: yaw -> pitch -> roll (Y -> X -> Z)
+            cos_p, sin_p = math.cos(pitch), math.sin(pitch)
+            cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+            cos_r, sin_r = math.cos(roll), math.sin(roll)
+            
+            # Combined rotation matrix (YXZ order)
+            R = np.array([
+                [cos_y*cos_r - sin_y*sin_p*sin_r, -cos_y*sin_r - sin_y*sin_p*cos_r, -sin_y*cos_p],
+                [cos_p*sin_r, cos_p*cos_r, -sin_p],
+                [sin_y*cos_r + cos_y*sin_p*sin_r, -sin_y*sin_r + cos_y*sin_p*cos_r, cos_y*cos_p]
+            ], dtype=np.float32)
+            
+            # Create c2w matrix
+            c2w_matrices[i, :3, :3] = R
+            c2w_matrices[i, :3, 3] = pos
+        
+        return torch.from_numpy(c2w_matrices)
+
+
+def extract_znear_zfar_from_projection(Ps):
+    """
+    Extracts near and far plane distances from a right-handed projection matrix.
+    NOTE: The formula B/(A+1) yields the far plane and B/(A-1) yields the near plane.
+    This function returns them in that "swapped" order, as required by the
+    linearization function for a reversed-Z depth buffer.
+    """
+    # Using names that reflect the swapped output needed for the next step.
+    far_distances = []
+    near_distances = []
+    for P in Ps:
+        A = P[2, 2]
+        B = P[2, 3]
+
+        # In a right-handed system, B/(A+1) is the far plane distance.
+        far_dist = B / (A + 1.0)
+        # And B/(A-1) is the near plane distance.
+        near_dist = B / (A - 1.0)
+        
+        far_distances.append(far_dist)
+        near_distances.append(near_dist)
+    
+    # Aggregate and return in the order the linearization function expects.
+    # The first returned value is the FAR distance, the second is the NEAR distance.
+    # return np.min(far_distances), np.max(near_distances)
+    return np.array(far_distances), np.array(near_distances)
+
+
+def extract_near_far_from_projection(proj_matrices: np.ndarray) -> torch.Tensor:
+    """Extract near and far planes from projection matrices.
+    
+    Args:
+        proj_matrices: [N, 4, 4] perspective projection matrices
+    
+    Returns:
+        [N, 2] near and far bounds for each frame
+    """
+    far_distances, near_distances = extract_znear_zfar_from_projection(proj_matrices)
+    # Stack as [N, 2] where each row is [near, far]
+    near_fars = np.stack([near_distances, far_distances], axis=1)
+    return torch.from_numpy(near_fars.astype(np.float32))
+
+
+def load_dmlab_intrinsics(img_h: int, img_w: int, fov_degrees: float, downsample: float) -> Intrinsics:
+    """Create camera intrinsics for DMlab data.
+    
+    Args:
+        img_h: Image height
+        img_w: Image width  
+        fov_degrees: Field of view in degrees
+        downsample: Downsampling factor
+    
+    Returns:
+        Camera intrinsics object
+    """
+    from .intrinsics import Intrinsics
+    import math
+    
+    # Compute downsampled dimensions
+    height = int(img_h / downsample)
+    width = int(img_w / downsample)
+    
+    # Compute focal length from FOV
+    # For square FOV (fovx = fovy = 90 degrees)
+    fov_rad = math.radians(fov_degrees)
+    focal_length = (width / 2.0) / math.tan(fov_rad / 2.0)
+    
+    # Principal point at image center
+    cx = width / 2.0
+    cy = height / 2.0
+    
+    return Intrinsics(
+        height=height,
+        width=width,
+        focal_x=focal_length,
+        focal_y=focal_length,
+        center_x=cx,
+        center_y=cy
+    )
+
+
+def generate_dmlab_render_poses(train_poses: np.ndarray, n_frames: int = 120) -> np.ndarray:
+    """Generate render poses for DMlab data.
+    
+    Args:
+        train_poses: [N, 3, 4] training camera poses
+        n_frames: Number of render frames to generate
+    
+    Returns:
+        [n_frames, 3, 4] render poses
+    """
+    # Extract camera positions and compute scene center
+    positions = train_poses[:, :3, 3]  # [N, 3]
+    scene_center = positions.mean(axis=0)
+    
+    # Compute average camera height and radius from center
+    avg_height = positions[:, 2].mean()
+    radius = np.linalg.norm(positions[:, :2] - scene_center[:2], axis=1).mean()
+    
+    # Generate circular path around scene center
+    render_poses = []
+    for i in range(n_frames):
+        angle = 2 * np.pi * i / n_frames
+        
+        # Camera position on circular path
+        pos = np.array([
+            scene_center[0] + radius * np.cos(angle),
+            scene_center[1] + radius * np.sin(angle), 
+            avg_height
+        ])
+        
+        # Camera looks towards scene center
+        forward = scene_center - pos
+        forward = forward / np.linalg.norm(forward)
+        
+        # Up vector
+        up = np.array([0, 0, 1])
+        
+        # Right vector
+        right = np.cross(forward, up)
+        right = right / np.linalg.norm(right)
+        
+        # Recompute up vector
+        up = np.cross(right, forward)
+        up = up / np.linalg.norm(up)
+        
+        # Create pose matrix
+        pose = np.eye(4)[:3]  # [3, 4]
+        pose[:3, 0] = right
+        pose[:3, 1] = up
+        pose[:3, 2] = -forward  # Camera looks along -Z
+        pose[:3, 3] = pos
+        
+        render_poses.append(pose)
+    
+    return np.stack(render_poses, 0)
+
+
+def getRawDepth(depth_buffer_val, proj_matrices):
+    """Converts depth from buffer a [0,1] range to view-space linear depth."""
+    zNears, zFars = extract_znear_zfar_from_projection(proj_matrices)
+    while zNears.ndim < depth_buffer_val.ndim:
+        zNears = np.expand_dims(zNears, -1)
+        zFars = np.expand_dims(zFars, -1)
+    ndc_depth = depth_buffer_val * 2.0 - 1.0  # [0, 1] -> [-1, 1]
+    view_space_depth = (2.0 * zNears * zFars) / (zFars + zNears - ndc_depth * (zFars - zNears))
+    return view_space_depth
+
+
+def convert_dmlab_depth(depth: np.ndarray, proj_matrices: np.ndarray) -> np.ndarray:
+    """Convert DMlab reverse NDC depth to view-space linear depth.
+    
+    DMlab depth format:
+    - Value 0 corresponds to zfar (far plane)
+    - Value 1 corresponds to znear (near plane)
+    
+    Args:
+        depth: [..., H, W] or [..., H, W, 1] reverse NDC depth values in [0, 1]
+        proj_matrices: [..., 4, 4] projection matrices
+    
+    Returns:
+        [..., H, W] view-space linear depth values
+    """
+    return getRawDepth(depth, proj_matrices)
