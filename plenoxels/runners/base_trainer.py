@@ -218,14 +218,21 @@ class BaseTrainer(abc.ABC):
             gt = gt[..., :3] * gt[..., 3:] + (1.0 - gt[..., 3:])
 
         err = (gt - preds) ** 2
-        return {
+        result = {
             "mse": torch.mean(err),
             "psnr": metrics.psnr(preds, gt),
             "ssim": metrics.ssim(preds, gt),
-            "ms-ssim": metrics.msssim(preds, gt),
             #"alex_lpips": metrics.rgb_lpips(preds, gt, net_name='alex', device=err.device),
             #"vgg_lpips": metrics.rgb_lpips(preds, gt, net_name='vgg', device=err.device)
         }
+        
+        # Only compute MS-SSIM if image size is large enough (need height > 160)
+        if preds.shape[0] > 160:
+            result["ms-ssim"] = metrics.msssim(preds, gt)
+        else:
+            log.debug(f"Skipping MS-SSIM calculation: image height {preds.shape[0]} < 160")
+            
+        return result
 
     def evaluate_metrics(self,
                          gt: Optional[torch.Tensor],
