@@ -155,8 +155,48 @@ class LowrankModel(nn.Module):
 
     @staticmethod
     def render_depth(weights: torch.Tensor, ray_samples: RaySamples, rays_d: torch.Tensor):
-        steps = (ray_samples.starts + ray_samples.ends) / 2
-        one_minus_transmittance = torch.sum(weights, dim=-2)
+        """
+        BENHAO: TOREAD
+        Render expected depth using volume rendering with background compensation.
+        
+        This function implements depth estimation for volume rendering based on:
+        D = ∫ T(t) · σ(t) · t dt + (1 - ∫ T(t) · σ(t) dt) · t_far
+        
+        The depth rendering has two components:
+        1. Weighted expected depth from foreground objects
+        2. Background depth compensation for non-occluded rays
+        
+        Args:
+            weights: Volume rendering weights [num_rays, num_samples, 1]
+                    w_i = α_i * T_i where α_i = 1-exp(-σ_i*Δt_i) and T_i = exp(-∑σ_j*Δt_j)
+            ray_samples: Discretized ray sampling intervals containing starts/ends distances
+            rays_d: Ray direction vectors, used to extract far plane distance [num_rays, 3]
+                   rays_d[..., -1:] typically contains the far clipping distance
+        
+        Returns:
+            depth: Expected depth for each ray [num_rays, 1]
+        
+        Physics:
+        - For opaque surfaces: depth ≈ surface distance (∑w_i ≈ 1, background term ≈ 0)
+        - For transparent/sparse scenes: includes both object depth and background depth
+        - For empty rays: depth ≈ far plane distance (∑w_i ≈ 0, background term dominates)
+        
+        Mathematical breakdown:
+        - steps: t_i = (starts_i + ends_i) / 2  # center point of each sampling interval
+        - foreground: ∑(w_i * t_i)  # weighted expected depth from volume rendering
+        - background: (1 - ∑w_i) * t_far  # compensation for non-occluded portion
+        """
+        # Calculate the center distance of each sampling interval along the ray
+        # This represents the "representative distance" t_i for each volume element
+        steps = (ray_samples.starts + ray_samples.ends) / 2  # [num_rays, num_samples, 1]
+        
+        # Calculate total accumulated opacity: ∑w_i = 1 - T_final
+        # This tells us how much of the ray is occluded by foreground objects
+        one_minus_transmittance = torch.sum(weights, dim=-2)  # [num_rays, 1]
+        
+        # Compute expected depth as weighted sum of distances plus background compensation
+        # Part 1: ∑(w_i * t_i) - expected depth from volume rendering
+        # Part 2: (1 - ∑w_i) * t_far - depth contribution from non-occluded background
         depth = torch.sum(weights * steps, dim=-2) + one_minus_transmittance * rays_d[..., -1:]
         return depth
 
