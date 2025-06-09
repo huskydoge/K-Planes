@@ -229,6 +229,12 @@ class KPlaneField(nn.Module):
             pts = torch.cat((pts, timestamps), dim=-1)  # [n_rays, n_samples, 4]
 
         pts = pts.reshape(-1, pts.shape[-1])
+        # Interpolate multi-scale features from K-Planes grids
+        # pts: 3D points to query features for [batch_size, 3]
+        # ms_grids: Multi-scale K-Planes grids storing learned features
+        # grid_dimensions: Resolution of each plane in the grids
+        # concat_features: Whether to concatenate features from different scales
+        # Returns: Interpolated features for each point [batch_size, feature_dim]
         features = interpolate_ms_features(
             pts, ms_grids=self.grids,  # noqa
             grid_dimensions=self.grid_config[0]["grid_dimensions"],
