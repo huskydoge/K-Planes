@@ -136,14 +136,14 @@ class Video360Dataset(BaseDataset):
                 transform, img_h=img_h, img_w=img_w, downsample=self.downsample)
         elif dset_type == "dmlab":
             if split == "render":
-                # Load data and create render poses
-                poses, imgs, timestamps, per_cam_near_fars = load_dmlab_data(datadir, split='train', max_tsteps=self.max_tsteps)
-                # Generate spiral render path around the scene
-                render_poses = generate_dmlab_render_poses(poses.numpy(), n_frames=120)
-                self.poses = torch.from_numpy(render_poses).float()
-                self.per_cam_near_fars = per_cam_near_fars[:1]  # Use first camera's near/far
-                timestamps = torch.linspace(0, 119, len(self.poses))
-                imgs = None
+                # Load test set data for timestamps and base poses
+                poses, imgs, timestamps, per_cam_near_fars = load_dmlab_data(datadir, split='test', max_tsteps=self.max_tsteps)
+                # Add small perturbations to poses while keeping timestamps identical
+                # poses is already in [N, 3, 4] c2w format from load_dmlab_data
+                perturbed_poses = generate_perturbed_render_poses(poses.numpy(), n_variations=1)
+                self.poses = torch.from_numpy(perturbed_poses).float()
+                self.per_cam_near_fars = per_cam_near_fars.float()
+                imgs = None  # No ground truth images for render split
             else:
                 poses, imgs, timestamps, per_cam_near_fars = load_dmlab_data(datadir, split=split, max_tsteps=self.max_tsteps)
                 self.poses = poses.float()
@@ -233,7 +233,7 @@ class Video360Dataset(BaseDataset):
                  f"Loaded {self.split} set from {self.datadir}: "
                  f"{len(self.poses)} images of size {self.img_h}x{self.img_w}. "
                  f"Images loaded: {self.imgs is not None}. "
-                 f"{len(torch.unique(timestamps))} timestamps. Near-far: {self.per_cam_near_fars}. "
+                 f"{len(torch.unique(timestamps))} timestamps. Near-far: {self.per_cam_near_fars.shape}. "
                  f"ISG={self.isg}, IST={self.ist}, weights_subsampled={self.weights_subsampled}. "
                  f"Sampling without replacement={self.use_permutation}. {intrinsics}")
 
@@ -579,7 +579,7 @@ def load_dmlab_data(datadir: str, split: str, max_tsteps: Optional[int] = None) 
         - near_fars: [N, 2] near and far bounds for each frame
     """
     # Find npz file in the directory
-    npz_files = glob.glob(os.path.join(datadir, "*.npz"))
+    npz_files = sorted(glob.glob(os.path.join(datadir, "*.npz")))
     if not npz_files:
         raise FileNotFoundError(f"No .npz files found in {datadir}")
     
@@ -606,11 +606,12 @@ def load_dmlab_data(datadir: str, split: str, max_tsteps: Optional[int] = None) 
     
     # Load depth if available (Note: DMlab depth is reverse NDC depth)
     # depth_video = data['depth_video']  # (T, H, W, 1) - zfar=0, znear=1
-    
+
     if max_tsteps is not None and max_tsteps < num_frames:
         # Subsample frames
-        step = num_frames // max_tsteps
-        indices = np.arange(0, num_frames, step)[:max_tsteps]
+        # step = num_frames // max_tsteps
+        # indices = np.arange(0, num_frames, step)[:max_tsteps]
+        indices = np.arange(num_frames)[:max_tsteps] # here we just use the first max_tsteps frames, to make sure the timestamps are continuous, aligned with the training data
         log.info(f"Subsampling DMlab data: {num_frames} -> {len(indices)} frames")
         
         video = video[indices]
@@ -621,13 +622,11 @@ def load_dmlab_data(datadir: str, split: str, max_tsteps: Optional[int] = None) 
     
     # Create train/test split
     if split == 'train':
-        # Use first 70% for training (ensure sufficient frames)
-        split_point = max(1, int(0.7 * num_frames))
-        frame_indices = np.arange(0, split_point)
+        # Use all available frames for training
+        frame_indices = np.arange(num_frames)
     elif split == 'test':
-        # Use last 30% for testing (ensure sufficient frames for video)
-        split_point = max(1, int(0.7 * num_frames))
-        frame_indices = np.arange(split_point, num_frames)
+        # Use SAME frames as training for overfitting experiment
+        frame_indices = np.arange(num_frames)
     else:
         # Use all frames
         frame_indices = np.arange(num_frames)
@@ -879,6 +878,70 @@ def generate_dmlab_render_poses(train_poses: np.ndarray, n_frames: int = 120) ->
         pose[:3, 3] = pos
         
         render_poses.append(pose)
+    
+    return np.stack(render_poses, 0)
+
+
+def generate_perturbed_render_poses(test_poses: np.ndarray, n_variations: int = 1,
+                                    pos_noise_scale = 0.02,
+                                    angle_noise = 0.0) -> np.ndarray:
+    """Generate render poses by adding small perturbations to test poses.
+    
+    Args:
+        test_poses: [N, 3, 4] test camera poses to use as base
+        n_variations: Number of perturbation variations per test pose
+        pos_noise_scale: Scale of position perturbation, default is 0.001
+        angle_noise: Scale of rotation perturbation, default is 0.5
+    
+    Returns:
+        [N * n_variations, 3, 4] render poses with perturbations
+    """
+    import numpy as np
+    
+    N = test_poses.shape[0]
+    render_poses = []
+    
+    # Set random seed for reproducible perturbations
+    np.random.seed(42)
+    
+    for i in range(N):
+        base_pose = test_poses[i]  # [3, 4]
+        base_pos = base_pose[:3, 3]  # Camera position
+        base_rot = base_pose[:3, :3]  # Camera rotation matrix
+        
+        for v in range(n_variations):
+            # Generate very small perturbations
+            # Position perturbation: ±0.1% of scene scale
+            pos_perturbation = np.random.normal(0, pos_noise_scale * np.linalg.norm(base_pos), 3)
+            
+            # Rotation perturbation: very small angles (±0.5 degrees)
+            rotation_perturbation = np.random.normal(0, np.radians(angle_noise), 3)
+            
+            # Apply position perturbation
+            new_pos = base_pos + pos_perturbation
+            
+            # Apply rotation perturbation using Rodrigues' formula
+            new_rot = base_rot.copy()
+            for axis in range(3):
+                if abs(rotation_perturbation[axis]) > 1e-6:
+                    # Create rotation matrix for small angle around axis
+                    angle = rotation_perturbation[axis]
+                    axis_vec = np.zeros(3)
+                    axis_vec[axis] = 1.0
+                    
+                    # Rodrigues' rotation formula for small angles
+                    K = np.array([[0, -axis_vec[2], axis_vec[1]],
+                                 [axis_vec[2], 0, -axis_vec[0]],
+                                 [-axis_vec[1], axis_vec[0], 0]])
+                    R_delta = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * K @ K
+                    new_rot = R_delta @ new_rot
+            
+            # Create new pose
+            new_pose = np.zeros((3, 4))
+            new_pose[:3, :3] = new_rot
+            new_pose[:3, 3] = new_pos
+            
+            render_poses.append(new_pose)
     
     return np.stack(render_poses, 0)
 

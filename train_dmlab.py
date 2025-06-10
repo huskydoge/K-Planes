@@ -21,7 +21,9 @@ def main():
     cmd = [
         sys.executable, "plenoxels/main.py",
         "--config-path", config_path,
-        "--seed", "42"
+        "--seed", "42",
+        "--render-only",
+        "--log-dir", "/data/hansen/projects/benhao/K-Planes/logs/dmlab/dmlab_debug_train_fr_50_test_fr_50"
     ]
     
     print("Starting DMlab training...")

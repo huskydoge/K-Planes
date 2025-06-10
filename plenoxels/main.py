@@ -8,6 +8,15 @@ from typing import List, Dict, Any
 import tempfile
 
 import numpy as np
+import torch
+import torch.utils.data
+from plenoxels.runners import video_trainer
+from plenoxels.runners import phototourism_trainer
+from plenoxels.runners import static_trainer
+from plenoxels.utils.create_rendering import render_to_path, decompose_space_time
+from plenoxels.utils.parse_args import parse_optfloat
+from omegaconf import OmegaConf
+from pathlib import Path
 
 
 def get_freer_gpu():
@@ -94,6 +103,7 @@ def main():
     p.add_argument('--render-only', action='store_true')
     p.add_argument('--validate-only', action='store_true')
     p.add_argument('--spacetime-only', action='store_true')
+    p.add_argument('--perturbation-analysis', action='store_true', help='Run perturbation analysis')
     p.add_argument('--config-path', type=str, required=True)
     p.add_argument('--log-dir', type=str, default=None)
     p.add_argument('--seed', type=int, default=0)
@@ -110,23 +120,32 @@ def main():
     cfg = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cfg)
     config: Dict[str, Any] = cfg.config
+    
     # Process overrides from argparse into config
-    # overrides can be passed from the command line as key=value pairs. E.g.
-    # python plenoxels/main.py --config-path plenoxels/config/cfg.py max_ts_frames=200
-    # note that all values are strings, so code should assume incorrect data-types for anything
-    # that's derived from config - and should not a string.
     overrides: List[str] = args.override
     overrides_dict = {ovr.split("=")[0]: ovr.split("=")[1] for ovr in overrides}
     config.update(overrides_dict)
+    
+    # Determine model type
     if "keyframes" in config:
         model_type = "video"
     elif "appearance_embedding_dim" in config:
         model_type = "phototourism"
     else:
         model_type = "static"
-    validate_only = args.validate_only
+        
     render_only = args.render_only
+    validate_only = args.validate_only
     spacetime_only = args.spacetime_only
+    perturbation_analysis = args.perturbation_analysis
+
+    # For validation, rendering, or analysis modes, ensure we have log_dir
+    if validate_only or render_only or spacetime_only or perturbation_analysis:
+        if args.log_dir is not None:
+            config['logdir'] = args.log_dir
+        else:
+            raise ValueError("--log-dir is required for validation, rendering, or analysis modes")
+
     if validate_only and render_only:
         raise ValueError("render_only and validate_only are mutually exclusive.")
     if render_only and spacetime_only:
@@ -134,26 +153,45 @@ def main():
     if validate_only and spacetime_only:
         raise ValueError("validate_only and spacetime_only are mutually exclusive.")
 
+    # Print config for debugging
     pprint.pprint(config)
-    if validate_only or render_only:
-        assert args.log_dir is not None and os.path.isdir(args.log_dir)
-    else:
+    
+    # Save config if training
+    if not (validate_only or render_only or spacetime_only or perturbation_analysis):
         save_config(config)
-
-    data = load_data(model_type, validate_only=validate_only, render_only=render_only or spacetime_only, **config)
+    
+    data = load_data(model_type, validate_only=validate_only, render_only=render_only or spacetime_only or perturbation_analysis, **config)
     config.update(data)
+    
     trainer = init_trainer(model_type, **config)
-    if args.log_dir is not None:
-        checkpoint_path = os.path.join(args.log_dir, "model.pth")
-        training_needed = not (validate_only or render_only or spacetime_only)
-        trainer.load_model(torch.load(checkpoint_path), training_needed=training_needed)
 
     if validate_only:
+        checkpoint_path = os.path.join(config["logdir"], "model.pth")
+        trainer.load_model(torch.load(checkpoint_path), training_needed=False)
         trainer.validate()
     elif render_only:
-        render_to_path(trainer, extra_name="")
+        checkpoint_path = os.path.join(config["logdir"], "model.pth")
+        trainer.load_model(torch.load(checkpoint_path), training_needed=False)
+        render_to_path(trainer)
     elif spacetime_only:
-        decompose_space_time(trainer, extra_name="")
+        checkpoint_path = os.path.join(config["logdir"], "model.pth")
+        trainer.load_model(torch.load(checkpoint_path), training_needed=False)
+        decompose_space_time(trainer)
+    elif perturbation_analysis:
+        checkpoint_path = os.path.join(config["logdir"], "model.pth")
+        trainer.load_model(torch.load(checkpoint_path), training_needed=False)
+        # Define parameter pairs for analysis
+        param_pairs = [
+            (0.0, 0.0),      # Baseline
+            (0.001, 0.0),    # Small position noise
+            (0.005, 0.0),    # Medium position noise
+            (0.01, 0.0),     # Large position noise
+            (0.0, 0.1),      # Small rotation noise
+            (0.0, 0.5),      # Medium rotation noise
+            (0.0, 1.0),      # Large rotation noise
+            (0.005, 0.5),    # Combined noise
+        ]
+        trainer.render_with_perturbations(param_pairs)
     else:
         trainer.train()
 

@@ -1,6 +1,6 @@
 # https://github.com/sarafridov/K-Planes/issues/1
 config = {
- 'expname': 'dmlab_debug1',
+ 'expname': 'dmlab_debug_train_fr_50_test_fr_50',
  'logdir': './logs/dmlab',
  'device': 'cuda:0',
 
@@ -9,8 +9,9 @@ config = {
  'data_dirs': ['/data/hansen/projects/benhao/wm-memory/data/dmlab/debug/1'],
  'contract': False,
  'ndc': False,  # DMlab uses standard perspective projection
- 'max_tsteps': None,  # Use all timesteps
- 'keyframes': False,
+ 'max_train_tsteps': 50,  
+ 'max_test_tsteps': 50,  
+ 'keyframes': True,
  'scene_bbox': [[92.9, 86.5, 1.1], [712.6, 600.0, 101.1]],  # DMlab room dimensions
  
  # Importance sampling settings
@@ -19,11 +20,6 @@ config = {
  'ist_step': -1,  # Disable IST - not suitable for ego-centric camera motion
 
  # Optimization settings
- 'num_steps': 101,  # Reduced for initial testing
- 'batch_size': 2048,  # Smaller batch for 128x128 images
- 'scheduler_type': 'warmup_cosine',
- 'optim_type': 'adam',
- 'lr': 0.01,
 
  # Regularization
  'distortion_loss_weight': 0.001,
@@ -36,10 +32,15 @@ config = {
  'time_smoothness_weight_proposal_net': 1e-05,
 
  # Training settings
- 'save_every': 10000,
- 'valid_every': 100,
+ 'save_every': 1000,
+ 'valid_every': 1000,
  'save_outputs': True,
  'train_fp16': True,
+ 'num_steps': 10000,  # Reduced for initial testing
+ 'batch_size': 8192,  # Smaller batch for 128x128 images
+ 'scheduler_type': 'warmup_cosine',
+ 'optim_type': 'adam',
+ 'lr': 0.01,
 
  # Raymarching settings
  'single_jitter': False,
